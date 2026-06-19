@@ -1,0 +1,402 @@
+import itertools
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import messages as bm
+import pytest
+
+from handlers import bot_profile_cache, telegram_ui_utils
+from handlers import utils
+from services.logger import summarize_text_for_log, summarize_url_for_log
+from utils.download_manager import DownloadProgress
+
+
+@pytest.mark.asyncio
+async def test_maybe_delete_user_message_success():
+    message = SimpleNamespace(delete=AsyncMock(return_value=True), answer=AsyncMock())
+
+    result = await utils.maybe_delete_user_message(message, "on")
+
+    assert result is True
+    message.delete.assert_awaited_once()
+    message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_delete_user_message_handles_error(monkeypatch):
+    class DummyTelegramError(Exception):
+        pass
+
+    message = SimpleNamespace(delete=AsyncMock(side_effect=DummyTelegramError()), answer=AsyncMock())
+    monkeypatch.setattr(telegram_ui_utils, "TelegramAPIError", DummyTelegramError)
+
+    result = await utils.maybe_delete_user_message(message, "on")
+
+    assert result is False
+    message.answer.assert_awaited_once_with(bm.delete_permission_warning())
+
+
+@pytest.mark.asyncio
+async def test_maybe_delete_user_message_skips_when_flag_off():
+    message = SimpleNamespace(delete=AsyncMock(), answer=AsyncMock())
+
+    result = await utils.maybe_delete_user_message(message, "off")
+
+    assert result is False
+    message.delete.assert_not_awaited()
+    message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_bot_url(monkeypatch):
+    monkeypatch.setattr(bot_profile_cache, "_bot_username", None)
+    monkeypatch.setattr(bot_profile_cache, "_bot_id", None)
+    bot = SimpleNamespace(
+        get_me=AsyncMock(return_value=SimpleNamespace(username="downloader_bot", id=777))
+    )
+
+    url = await utils.get_bot_url(bot)
+
+    assert url == "t.me/downloader_bot"
+    bot.get_me.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_bot_url_and_id_share_identity_fetch(monkeypatch):
+    monkeypatch.setattr(bot_profile_cache, "_bot_username", None)
+    monkeypatch.setattr(bot_profile_cache, "_bot_id", None)
+    bot = SimpleNamespace(
+        get_me=AsyncMock(return_value=SimpleNamespace(username="downloader_bot", id=999))
+    )
+
+    url = await utils.get_bot_url(bot)
+    bot_id = await utils._get_bot_id(bot)
+
+    assert url == "t.me/downloader_bot"
+    assert bot_id == 999
+    bot.get_me.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_bot_avatar_thumbnail_uses_small_audio_compatible_photo(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot_profile_cache, "_bot_username", None)
+    monkeypatch.setattr(bot_profile_cache, "_bot_id", None)
+    monkeypatch.setattr(bot_profile_cache, "_bot_avatar_path", None)
+    monkeypatch.setattr(bot_profile_cache, "_AUDIO_THUMB_PATH", tmp_path / "bot_audio_thumbnail.jpg")
+    photos = SimpleNamespace(
+        total_count=1,
+        photos=[[
+            SimpleNamespace(file_id="small", width=160, height=160, file_size=32_000),
+            SimpleNamespace(file_id="large", width=640, height=640, file_size=240_000),
+        ]],
+    )
+    async def fake_download(_file_id, destination):
+        destination.write(b"image-bytes")
+
+    def fake_normalize(source_path: Path, output_path: Path) -> bool:
+        output_path.write_bytes(source_path.read_bytes())
+        return True
+
+    bot = SimpleNamespace(
+        get_me=AsyncMock(return_value=SimpleNamespace(username="downloader_bot", id=777)),
+        get_user_profile_photos=AsyncMock(return_value=photos),
+        download=AsyncMock(side_effect=fake_download),
+    )
+    monkeypatch.setattr(bot_profile_cache, "_normalize_audio_thumbnail_file", fake_normalize)
+
+    thumbnail = await utils.get_bot_avatar_thumbnail(bot)
+
+    assert thumbnail.path == str(tmp_path / "bot_audio_thumbnail.jpg")
+    bot.download.assert_awaited_once()
+    assert bot.download.await_args.args[0] == "small"
+    assert (tmp_path / "bot_audio_thumbnail.jpg").read_bytes() == b"image-bytes"
+
+
+@pytest.mark.asyncio
+async def test_get_bot_avatar_thumbnail_rejects_empty_download(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot_profile_cache, "_bot_username", None)
+    monkeypatch.setattr(bot_profile_cache, "_bot_id", None)
+    monkeypatch.setattr(bot_profile_cache, "_bot_avatar_path", None)
+    monkeypatch.setattr(bot_profile_cache, "_AUDIO_THUMB_PATH", tmp_path / "bot_audio_thumbnail.jpg")
+    photos = SimpleNamespace(
+        total_count=1,
+        photos=[[
+            SimpleNamespace(file_id="small", width=160, height=160, file_size=32_000),
+        ]],
+    )
+
+    async def fake_download(_file_id, _destination):
+        return None
+
+    bot = SimpleNamespace(
+        get_me=AsyncMock(return_value=SimpleNamespace(username="downloader_bot", id=777)),
+        get_user_profile_photos=AsyncMock(return_value=photos),
+        download=AsyncMock(side_effect=fake_download),
+    )
+
+    thumbnail = await utils.get_bot_avatar_thumbnail(bot)
+
+    assert thumbnail is None
+    assert not (tmp_path / "bot_audio_thumbnail.jpg").exists()
+
+
+@pytest.mark.asyncio
+async def test_remove_file_deletes_existing(tmp_path):
+    target = tmp_path / "temp.txt"
+    target.write_text("data")
+
+    await utils.remove_file(str(target))
+
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_remove_file_ignores_missing(tmp_path):
+    missing = tmp_path / "missing.txt"
+
+    await utils.remove_file(str(missing))
+
+    assert not missing.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_chat_action_if_needed_triggers():
+    telegram_ui_utils._chat_action_cache.clear()
+    bot = SimpleNamespace(send_chat_action=AsyncMock())
+
+    await utils.send_chat_action_if_needed(bot, chat_id=1, action="typing", business_id=None)
+
+    bot.send_chat_action.assert_awaited_once_with(1, "typing")
+
+
+@pytest.mark.asyncio
+async def test_send_chat_action_if_needed_skips_for_business():
+    telegram_ui_utils._chat_action_cache.clear()
+    bot = SimpleNamespace(send_chat_action=AsyncMock())
+
+    await utils.send_chat_action_if_needed(bot, chat_id=1, action="typing", business_id=123)
+
+    bot.send_chat_action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_chat_action_if_needed_throttles_duplicates():
+    telegram_ui_utils._chat_action_cache.clear()
+    bot = SimpleNamespace(send_chat_action=AsyncMock())
+
+    await utils.send_chat_action_if_needed(bot, chat_id=1, action="typing", business_id=None)
+    await utils.send_chat_action_if_needed(bot, chat_id=1, action="typing", business_id=None)
+
+    bot.send_chat_action.assert_awaited_once_with(1, "typing")
+
+
+@pytest.mark.asyncio
+async def test_react_to_message_skips_for_business(monkeypatch):
+    message = SimpleNamespace(
+        business_connection_id=42,
+        react=AsyncMock(),
+    )
+    monkeypatch.setattr(telegram_ui_utils.types, "ReactionTypeEmoji", lambda emoji: ("emoji", emoji))
+
+    await utils.react_to_message(message, "fire")
+
+    message.react.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_react_to_message_handles_errors(monkeypatch):
+    message = SimpleNamespace(
+        business_connection_id=None,
+        react=AsyncMock(side_effect=RuntimeError("fail")),
+    )
+    monkeypatch.setattr(telegram_ui_utils.types, "ReactionTypeEmoji", lambda emoji: ("emoji", emoji))
+
+    await utils.react_to_message(message, "fire", skip_if_business=False)
+
+    message.react.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_send_with_reaction_invokes_reply(monkeypatch):
+    mock_react = AsyncMock()
+    monkeypatch.setattr(telegram_ui_utils, "react_to_message", mock_react)
+    message = SimpleNamespace(reply=AsyncMock())
+
+    await utils._send_with_reaction(message, "hello", emoji="fire", business_id=7, skip_if_business=False)
+
+    mock_react.assert_awaited_once_with(
+        message,
+        "fire",
+        business_id=7,
+        skip_if_business=False,
+    )
+    message.reply.assert_awaited_once_with("hello")
+
+
+@pytest.mark.asyncio
+async def test_send_with_reaction_requires_method():
+    with pytest.raises(AttributeError):
+        await utils._send_with_reaction(SimpleNamespace(), "hello")
+
+
+@pytest.mark.asyncio
+async def test_handle_download_error_uses_default_text(monkeypatch):
+    mock_send = AsyncMock()
+    monkeypatch.setattr(telegram_ui_utils, "_send_with_reaction", mock_send)
+    monkeypatch.setattr(telegram_ui_utils.bm, "something_went_wrong", lambda: "oops")
+
+    message = SimpleNamespace()
+
+    await utils.handle_download_error(message)
+
+    await_args = mock_send.await_args
+    assert await_args.args[0] is message
+    assert await_args.args[1] == "oops"
+    assert await_args.kwargs["emoji"] == "👎"
+
+
+@pytest.mark.asyncio
+async def test_handle_video_too_large_uses_predefined_text(monkeypatch):
+    mock_send = AsyncMock()
+    monkeypatch.setattr(telegram_ui_utils, "_send_with_reaction", mock_send)
+    monkeypatch.setattr(telegram_ui_utils.bm, "video_too_large", lambda: "too big")
+
+    message = SimpleNamespace()
+
+    await utils.handle_video_too_large(message, business_id=11, skip_if_business=False)
+
+    await_args = mock_send.await_args
+    assert await_args.args[0] is message
+    assert await_args.args[1] == "too big"
+    assert await_args.kwargs["emoji"] == "👎"
+    assert await_args.kwargs["business_id"] == 11
+    assert await_args.kwargs["skip_if_business"] is False
+
+
+@pytest.mark.asyncio
+async def test_safe_edit_text_skips_identical_payloads():
+    telegram_ui_utils._message_edit_cache.clear()
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=123),
+        message_id=456,
+        edit_text=AsyncMock(),
+    )
+
+    await utils.safe_edit_text(message, "same text", parse_mode="HTML")
+    await utils.safe_edit_text(message, "same text", parse_mode="HTML")
+
+    message.edit_text.assert_awaited_once_with("same text", parse_mode="HTML")
+
+
+@pytest.mark.asyncio
+async def test_safe_edit_inline_text_skips_identical_payloads():
+    telegram_ui_utils._message_edit_cache.clear()
+    bot = SimpleNamespace(edit_message_text=AsyncMock())
+
+    first = await utils.safe_edit_inline_text(bot, "inline-1", "same text", parse_mode="HTML")
+    second = await utils.safe_edit_inline_text(bot, "inline-1", "same text", parse_mode="HTML")
+
+    assert first is True
+    assert second is True
+    bot.edit_message_text.assert_awaited_once_with(
+        text="same text",
+        inline_message_id="inline-1",
+        parse_mode="HTML",
+    )
+
+
+@pytest.mark.asyncio
+async def test_load_user_settings_uses_private_user_id():
+    db_service = SimpleNamespace(user_settings=AsyncMock(return_value={"captions": "on"}))
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=200, type="private"),
+        from_user=SimpleNamespace(id=100),
+    )
+
+    result = await utils.load_user_settings(db_service, message)
+
+    assert result == {"captions": "on"}
+    db_service.user_settings.assert_awaited_once_with(100)
+
+
+@pytest.mark.asyncio
+async def test_load_user_settings_uses_group_chat_id():
+    db_service = SimpleNamespace(user_settings=AsyncMock(return_value={"captions": "off"}))
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-555, type="supergroup"),
+        from_user=SimpleNamespace(id=100),
+    )
+
+    result = await utils.load_user_settings(db_service, message)
+
+    assert result == {"captions": "off"}
+    db_service.user_settings.assert_awaited_once_with(-555)
+
+
+@pytest.mark.asyncio
+async def test_make_status_text_progress_updater_throttles_intermediate_updates(monkeypatch):
+    update_text = AsyncMock()
+    monotonic_values = itertools.chain([10.0, 10.2, 10.4], itertools.repeat(10.4))
+    monkeypatch.setattr(telegram_ui_utils.time, "monotonic", lambda: next(monotonic_values))
+    on_progress = utils.make_status_text_progress_updater("Test media", update_text)
+
+    await on_progress(
+        DownloadProgress(
+            downloaded_bytes=10,
+            total_bytes=100,
+            elapsed=1.0,
+            speed_bps=10.0,
+            eta_seconds=9.0,
+            done=False,
+        )
+    )
+    await on_progress(
+        DownloadProgress(
+            downloaded_bytes=20,
+            total_bytes=100,
+            elapsed=2.0,
+            speed_bps=10.0,
+            eta_seconds=8.0,
+            done=False,
+        )
+    )
+    await on_progress(
+        DownloadProgress(
+            downloaded_bytes=100,
+            total_bytes=100,
+            elapsed=3.0,
+            speed_bps=30.0,
+            eta_seconds=0.0,
+            done=True,
+        )
+    )
+
+    assert update_text.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_make_retry_status_notifier_respects_threshold(monkeypatch):
+    update_text = AsyncMock()
+    monkeypatch.setattr(telegram_ui_utils.bm, "retrying_again_status", lambda attempt, total: f"retry {attempt}/{total}")
+    notifier = utils.make_retry_status_notifier(update_text)
+
+    await notifier(1, 4, RuntimeError("skip"))
+    await notifier(2, 4, RuntimeError("show"))
+
+    update_text.assert_awaited_once_with("retry 3/4")
+
+
+def test_summarize_url_for_log_uses_host_hint_and_hash():
+    summary = summarize_url_for_log("https://www.youtube.com/watch?v=abc123")
+
+    assert summary.startswith("www.youtube.com|")
+    assert "watch" not in summary
+    assert len(summary.split("|")[-1]) == 10
+
+
+def test_summarize_text_for_log_avoids_raw_text_echo():
+    summary = summarize_text_for_log("download this private note please")
+
+    assert summary.startswith("text|len=")
+    assert "private note" not in summary
